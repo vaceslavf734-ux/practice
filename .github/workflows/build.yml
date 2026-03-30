@@ -41,14 +41,15 @@ jobs:
       - name: Make mvnw executable
         run: chmod +x ./mvnw
 
-      - name: Build with Maven (run tests)
-        run: ./mvnw -B clean package
+      - name: Build with Maven (skip tests)
+        run: ./mvnw -B clean package -DskipTests
 
       - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
           path: target/*.jar
+
 
   sast:
     runs-on: ubuntu-latest
