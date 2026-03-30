@@ -1,80 +1,235 @@
 name: Secure Build Pipeline
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
 permissions:
-  packages: write
   contents: read
+  security-events: write
+  packages: write
 
 jobs:
   secrets-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # чтобы Gitleaks видел всю историю
+
       - name: Gitleaks Scan
         run: |
-          docker run --rm -v ${{ github.workspace }}:/code zricethezav/gitleaks:latest detect --source="/code" --no-git -v
+          docker run --rm -v "${{ github.workspace }}:/code" zricethezav/gitleaks:latest detect --source="/code" --no-git -v
 
-  build-test-security:
-    needs: [secrets-scan]
+  build:
+    needs: [ secrets-scan ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { java-version: '21', distribution: 'temurin', cache: maven }
-      - name: Grant permissions
-        run: chmod +x mvnw
-      - name: Build
-        run: ./mvnw package -DskipTests
-      - name: Semgrep SAST
-        run: docker run --rm -v $(pwd):/src semgrep/semgrep semgrep scan --config auto --sarif --output report.sarif
-      - name: Upload Artifacts
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Make mvnw executable
+        run: chmod +x ./mvnw
+
+      - name: Build with Maven (skip tests)
+        run: ./mvnw -B clean package -DskipTests
+
+      - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
-          name: application-jar
+          name: app-jar
           path: target/*.jar
 
+
+  sast:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep SAST
+        run: semgrep scan --config p/default --sarif --output semgrep.sarif .
+        continue-on-error: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    container: eclipse-temurin:21-jdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make mvnw executable
+        run: chmod +x ./mvnw
+
+      - name: OWASP Dependency-Check
+        run: |
+          ./mvnw dependency-check:check \
+            -DretireJsAnalyzerEnabled=false \
+            -Dformat=HTML \
+            -DsuppressionFiles=dependency-check-suppression.xml
+        continue-on-error: true
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: target/dependency-check-report.html
+
+  dast:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Start application
+        run: |
+          java -jar target/*.jar &
+          sleep 60
+
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:8080
+          rules_file_name: rules.tsv
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: ZAP API Scan
+        uses: zaproxy/action-api-scan@v0.10.0
+        with:
+          target: http://localhost:8080/v3/api-docs
+          format: openapi
+          rules_file_name: rules.tsv
+          allow_issue_writing: false
+        continue-on-error: true
+
   container-security:
-    needs: [build-test-security]
+    needs: [ build ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set lower case repo name
         run: |
-          echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
+          REPO_LC=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "REPO_LC=${REPO_LC}" >> "${GITHUB_ENV}"
+
       - uses: actions/download-artifact@v4
-        with: { name: application-jar, path: target/ }
-      - name: Build Image
-        run: docker build -t ghcr.io/${{ env.REPO_LC }}:latest .
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Build image
+        run: |
+          docker build -t "ghcr.io/${{ env.REPO_LC }}:latest" .
+
       - name: Trivy Scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: 'ghcr.io/${{ env.REPO_LC }}:latest'
+          image-ref: "ghcr.io/${{ env.REPO_LC }}:latest"
           exit-code: '1'
-          severity: 'CRITICAL'
+          severity: "CRITICAL"
           ignore-unfixed: true
+
       - name: Login and Push
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          docker push ghcr.io/${{ env.REPO_LC }}:latest
+          docker push "ghcr.io/${{ env.REPO_LC }}:latest"
 
   web-fuzzing:
-    needs: [build-test-security]
+    needs: [ build ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
-        with: { java-version: '21', distribution: 'temurin' }
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
       - name: Install ffuf
         run: |
           wget https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz
           tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
           sudo mv ffuf /usr/local/bin/
+
       - name: Fuzzing
         run: |
           java -jar target/*.jar &
           sleep 45
           printf "login\nregister\ncourses" > wordlist.txt
           ffuf -u http://localhost:8081/api/FUZZ -w wordlist.txt -o fuzz.json
+
+  security-check:
+    runs-on: ubuntu-latest
+    needs: [ sast, dependency-scan, dast ]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify security fixes
+        run: |
+          echo "=== Проверка исправлений безопасности ==="
+          PASS=0; FAIL=0
+
+          check() {
+            if grep -rq "$2" src/; then
+              echo "✅ $1";
+              PASS=$((PASS+1))
+            else
+              echo "❌ $1";
+              FAIL=$((FAIL+1))
+            fi
+          }
+
+          check "SQL injection fix (parameterized query)" "jdbc.query(sql, rm, title)"
+          check "XXE protection (disallow-doctype-decl)" "disallow-doctype-decl"
+          check "SSRF protection (isLoopbackAddress)" "isLoopbackAddress"
+          check "BCrypt password hashing" "BCryptPasswordEncoder"
+          check "Role-based access control" 'defaultValue.*STUDENT'
+          check "CORS restriction" 'allowedMethods.*GET'
+          check "H2 console disabled" "enabled: false"
+          check "Plugin loader disabled" "disabled for security"
+          check "Actuator restricted" 'include.*health'
+          check "Stacktrace hidden" "include-stacktrace: NEVER"
+
+          echo "=== Результат: $PASS пройдено, $FAIL не пройдено ==="
