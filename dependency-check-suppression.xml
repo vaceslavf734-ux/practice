@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <suppress>
+        <notes>Spring Boot managed dependencies - false positives</notes>
+        <cpe>cpe:/a:pivotal_software:spring_framework</cpe>
+    </suppress>
+</suppressions>

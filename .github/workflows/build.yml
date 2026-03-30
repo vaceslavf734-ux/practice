@@ -1,0 +1,80 @@
+name: Secure Build Pipeline
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gitleaks Scan
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/code zricethezav/gitleaks:latest detect --source="/code" --no-git -v
+
+  build-test-security:
+    needs: [secrets-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '21', distribution: 'temurin', cache: maven }
+      - name: Grant permissions
+        run: chmod +x mvnw
+      - name: Build
+        run: ./mvnw package -DskipTests
+      - name: Semgrep SAST
+        run: docker run --rm -v $(pwd):/src semgrep/semgrep semgrep scan --config auto --sarif --output report.sarif
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: target/*.jar
+
+  container-security:
+    needs: [build-test-security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set lower case repo name
+        run: |
+          echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
+      - uses: actions/download-artifact@v4
+        with: { name: application-jar, path: target/ }
+      - name: Build Image
+        run: docker build -t ghcr.io/${{ env.REPO_LC }}:latest .
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'ghcr.io/${{ env.REPO_LC }}:latest'
+          exit-code: '1'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+      - name: Login and Push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/${{ env.REPO_LC }}:latest
+
+  web-fuzzing:
+    needs: [build-test-security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '21', distribution: 'temurin' }
+      - name: Install ffuf
+        run: |
+          wget https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz
+          tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
+          sudo mv ffuf /usr/local/bin/
+      - name: Fuzzing
+        run: |
+          java -jar target/*.jar &
+          sleep 45
+          printf "login\nregister\ncourses" > wordlist.txt
+          ffuf -u http://localhost:8081/api/FUZZ -w wordlist.txt -o fuzz.json
